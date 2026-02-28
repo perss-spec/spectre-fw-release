@@ -1,5 +1,5 @@
 --[[============================================================
-  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.3
+  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.4
   Полётный контроллер: OrangeCube (ArduPlane)
   Параметры: Spectr_Cube+.param + param_changes.param
 ============================================================
@@ -8,6 +8,17 @@
       Каждые 2 мин в CRUISE при TRUSTED GPS командуем ±15° отклонение курса.
       Если GPS velocity не отвечает поворотом — score += 25.
       Параметры: STURN_INTERVAL_MS, STURN_OFFSET_DEG, STURN_WAIT_MS, STURN_MEAS_MS, STURN_MIN_RESP
+
+  ИЗМЕНЕНИЯ v3.8.4 (motor startup fix, 2026-02-28):
+    + FIX КРИТИЧЕСКИЙ: мотор не стартовал — TECS_PITCH_MAX=15 в param файле
+      ограничивал TECS даже во время spool (3с после throw). TECS с pitch≤15° +
+      низкая скорость после броска = недостаточный энергодефицит → throttle ≈ 0.
+      Исправление: при throw явно ставим TECS_PITCH_MAX=30 (полная свобода TECS),
+      после 3с spool → SOFT_CLIMB с TKOFF_PITCH_LIM=15.
+    + FIX: TECS_PITCH_MIN=0 в param → TECS не мог пикировать, ломал energy
+      management. Исправлено на -25° в param файле.
+    + FIX: TECS_PITCH_MAX=15 в param → слишком низко для крейсера.
+      Исправлено на 20° в param файле. Скрипт корректно сохраняет и восстанавливает.
 
   ИЗМЕНЕНИЯ v3.8.3 (real-hardware fixes, 2026-02-27):
     + FIX КРИТИЧЕСКИЙ: ahrs:get_yaw_rad() → ahrs:get_yaw() — метод get_yaw_rad
@@ -1372,10 +1383,13 @@ local function update()
                     S.launch_thrown = true
                     S.throw_ms = ms()
                     lg(SEV_ALERT, "THROW! da=" .. string.format("%.1f", da) .. "m/s2 > MOTOR ON")
-                    -- v3.8: НЕ ограничиваем TECS при броске!
-                    -- Сохраняем штатные лимиты для последующего SOFT_CLIMB
+                    -- v3.8.4: сохраняем штатные лимиты, ставим PITCH_MAX=30 для spool
+                    -- Param файл может иметь TECS_PITCH_MAX=15-20, что недостаточно
+                    -- для стартового разгона. 30° даёт TECS полную свободу → max throttle.
                     S.pitch_max_saved = param:get('TECS_PITCH_MAX') or 20
                     S.roll_lim_saved  = param:get('ROLL_LIMIT_DEG') or 45
+                    pset('TECS_PITCH_MAX', 30)   -- v3.8.4: полная свобода TECS при spool
+                    pset('ROLL_LIMIT_DEG', 45)   -- v3.8.4: не ограничиваем крен при spool
                     -- v3.8: target = CFG.ALT (1000м) — TECS получает большой дефицит → полный газ
                     local hdg = S.tgt_valid
                         and brg(S.dr_lat, S.dr_lng, S.tgt_lat, S.tgt_lng)
@@ -1423,6 +1437,8 @@ local function update()
             S.roll_lim_saved  = param:get('ROLL_LIMIT_DEG') or 45
             S.launch_thrown = true
             S.throw_ms = ms()
+            pset('TECS_PITCH_MAX', 30)   -- v3.8.4: полная свобода TECS при spool
+            pset('ROLL_LIMIT_DEG', 45)   -- v3.8.4: не ограничиваем крен при spool
             lg(SEV_WARN, "FLYING w/o throw detect — GUIDED + full ALT target")
             setmode(MODE_GUIDED)
             local hdg = S.tgt_valid
