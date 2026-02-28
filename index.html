@@ -8,51 +8,33 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0d1117;
-            color: #e6edf3;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            background: #0d1117; color: #e6edf3;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center;
         }
         .container {
-            max-width: 500px;
-            width: 90%;
-            padding: 40px;
-            background: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 12px;
+            max-width: 520px; width: 90%; padding: 40px;
+            background: #161b22; border: 1px solid #30363d; border-radius: 12px;
         }
         h1 { font-size: 24px; margin-bottom: 8px; color: #f0f6fc; }
         .subtitle { color: #8b949e; font-size: 14px; margin-bottom: 32px; }
         .file-card {
-            background: #0d1117;
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 16px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
+            background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+            padding: 20px; margin-bottom: 16px;
+            display: flex; align-items: center; justify-content: space-between;
         }
-        .file-info h3 { font-size: 16px; color: #e6edf3; margin-bottom: 4px; }
-        .file-info p { font-size: 13px; color: #8b949e; }
+        .file-info h3 { font-size: 15px; color: #e6edf3; margin-bottom: 2px; }
+        .file-info p { font-size: 12px; color: #8b949e; }
         .btn {
-            display: inline-block;
-            padding: 8px 20px;
-            background: #238636;
-            color: #fff;
-            text-decoration: none;
-            border-radius: 6px;
-            font-size: 14px;
-            font-weight: 500;
-            white-space: nowrap;
-            cursor: pointer;
-            border: none;
-            transition: background 0.2s;
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 9px 22px; background: #238636; color: #fff;
+            text-decoration: none; border-radius: 6px;
+            font-size: 14px; font-weight: 500; white-space: nowrap;
+            cursor: pointer; border: none; transition: background 0.2s;
         }
         .btn:hover { background: #2ea043; }
         .btn:disabled { background: #21262d; color: #8b949e; cursor: wait; }
+        .btn svg { width: 16px; height: 16px; fill: currentColor; }
+        .err { color: #f85149; font-size: 12px; margin-top: 8px; display: none; }
     </style>
 </head>
 <body>
@@ -62,43 +44,66 @@
 
         <div class="file-card">
             <div class="file-info">
-                <h3>wing_nav_v3.lua</h3>
-                <p>Навигационный скрипт</p>
+                <h3>Script v3.8.3</h3>
+                <p>.lua</p>
             </div>
-            <button class="btn" onclick="dl('https://raw.githubusercontent.com/perss-spec/spectre-fw-release/main/wing_nav_v3.lua','wing_nav_v3.lua',this)">Скачать</button>
+            <button class="btn" onclick="dl('wing_nav_v3.lua','wing_nav_v3.lua',this)">
+                <svg viewBox="0 0 16 16"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14Z"/><path d="M7.25 7.689V2a.75.75 0 0 1 1.5 0v5.689l1.97-1.969a.749.749 0 1 1 1.06 1.06l-3.25 3.25a.749.749 0 0 1-1.06 0L4.22 6.78a.749.749 0 1 1 1.06-1.06l1.97 1.969Z"/></svg>
+                Скачать
+            </button>
         </div>
 
         <div class="file-card">
             <div class="file-info">
-                <h3>Spectr_Cube+.param</h3>
-                <p>Параметры автопилота</p>
+                <h3>Params v3.8</h3>
+                <p>.param</p>
             </div>
-            <button class="btn" onclick="dl('https://raw.githubusercontent.com/perss-spec/spectre-fw-release/main/Spectr_Cube_Plus.param','Spectr_Cube+.param',this)">Скачать</button>
+            <button class="btn" onclick="dl('Spectr_Cube_Plus.param','Spectr_Cube+.param',this)">
+                <svg viewBox="0 0 16 16"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14Z"/><path d="M7.25 7.689V2a.75.75 0 0 1 1.5 0v5.689l1.97-1.969a.749.749 0 1 1 1.06 1.06l-3.25 3.25a.749.749 0 0 1-1.06 0L4.22 6.78a.749.749 0 1 1 1.06-1.06l1.97 1.969Z"/></svg>
+                Скачать
+            </button>
         </div>
+
+        <p class="err" id="errmsg"></p>
     </div>
 
     <script>
-    function dl(url, filename, btn) {
+    var API = 'https://api.github.com/repos/perss-spec/spectre-fw-release/contents/';
+
+    function dl(path, savename, btn) {
         btn.disabled = true;
-        btn.textContent = '...';
-        fetch(url)
-            .then(r => r.blob())
-            .then(blob => {
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(blob);
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                URL.revokeObjectURL(a.href);
-                btn.disabled = false;
-                btn.textContent = 'Скачать';
-            })
-            .catch(() => {
-                window.open(url, '_blank');
-                btn.disabled = false;
-                btn.textContent = 'Скачать';
-            });
+        btn.querySelector('svg').style.display = 'none';
+        btn.childNodes[btn.childNodes.length - 1].textContent = ' Загрузка...';
+        document.getElementById('errmsg').style.display = 'none';
+
+        fetch(API + encodeURIComponent(path), {
+            headers: { 'Accept': 'application/vnd.github.v3.raw' }
+        })
+        .then(function(r) {
+            if (!r.ok) throw new Error(r.status);
+            return r.blob();
+        })
+        .then(function(blob) {
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = savename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(a.href);
+            reset(btn);
+        })
+        .catch(function(e) {
+            document.getElementById('errmsg').textContent = 'Ошибка загрузки: ' + e.message;
+            document.getElementById('errmsg').style.display = 'block';
+            reset(btn);
+        });
+    }
+
+    function reset(btn) {
+        btn.disabled = false;
+        btn.querySelector('svg').style.display = '';
+        btn.childNodes[btn.childNodes.length - 1].textContent = ' Скачать';
     }
     </script>
 </body>
