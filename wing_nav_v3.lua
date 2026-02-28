@@ -1,8 +1,20 @@
 --[[============================================================
-  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.4
+  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.5
   Полётный контроллер: OrangeCube (ArduPlane)
   Параметры: Spectr_Cube+.param + param_changes.param
 ============================================================
+  ИЗМЕНЕНИЯ v3.8.5 (no-GPS motor fallback, 2026-02-28):
+    + FIX КРИТИЧЕСКИЙ: мотор не стартовал без GPS — EKF не инициализирован →
+      TECS не может управлять газом → ThO=0 → C3=1100 (idle) весь полёт.
+      Подтверждено логами 00000016.BIN и 00000017.BIN (GPS Status=1, NSats=0).
+      Исправление: при throw проверяем GPS. Если нет fix ≥ 3D:
+      → FBWA + SRV_Channels:set_output_pwm_chan_timeout() для прямого PWM газа.
+      Во время spool: 1750 PWM (~80%), SOFT_CLIMB: адаптивный по Pitot.
+      Если GPS появляется → переключение на штатный GUIDED + TECS.
+    + ADD: Safety monitor — если TECS не выдаёт газ (C3 < 1200) через 2с после
+      SOFT_CLIMB даже при GPS → автоматический fallback на прямой газ.
+    + ADD: Диагностика GPS при арме + кэш канала газа через SRV_Channels.
+
   ИЗМЕНЕНИЯ v3.6:
     + ADD: S-поворот для кинематической верификации GPS (L7)
       Каждые 2 мин в CRUISE при TRUSTED GPS командуем ±15° отклонение курса.
@@ -225,6 +237,14 @@ local CFG = {
     TKOFF_PITCH_LIM = 15,    -- ° — макс тангаж во время SOFT_CLIMB (ArduPilot: TKOFF_LVL_PITCH)
     TKOFF_ROLL_LIM  = 10,    -- ° — макс крен (прямолинейный набор, без поворотов)
 
+    -- ======= NO-GPS MOTOR FALLBACK (v3.8.5) =======
+    -- Когда GPS отсутствует: EKF не инициализирован → TECS ThO=0 → мотор idle.
+    -- Используем SRV_Channels:set_output_pwm_chan_timeout() для прямого PWM.
+    NO_GPS_THR_SPOOL  = 1750,   -- PWM при spool (мощный стартовый газ, ~80%)
+    NO_GPS_THR_CLIMB  = 1650,   -- PWM при SOFT_CLIMB/CLIMB (~70%)
+    NO_GPS_THR_CRUISE = 1500,   -- PWM при CRUISE (~50%)
+    NO_GPS_THR_TMO    = 500,    -- мс timeout PWM override (безопасность — если Lua упадёт)
+
     -- ======= СИСТЕМА =======
     LOOP_MS         = 200,
     LOG_MS          = 2000,
@@ -332,6 +352,10 @@ local S = {
     pitch_max_saved  = 20,    -- сохранённый TECS_PITCH_MAX
     roll_lim_saved   = 45,    -- сохранённый ROLL_LIMIT_DEG
 
+    -- NO-GPS motor fallback (v3.8.5)
+    no_gps_motor     = false, -- GPS отсутствует → прямое управление газом через PWM
+    thr_chan          = nil,   -- кэш канала газа (SRV_Channels:find_channel(70))
+
     -- S-поворот GPS верификация (v3.6)
     sturn_phase     = 0,      -- 0=idle, 1=turning (ждём оседания), 2=measuring
     sturn_ms        = 0,      -- время начала текущей фазы
@@ -412,6 +436,39 @@ local function pset(name, val)
     if not param:set(name, val) then
         lg(SEV_ERR, "PARAM FAIL: " .. name)
     end
+end
+
+-- v3.8.5: Прямое управление дросселем через PWM override (без TECS)
+-- Используется когда нет GPS → EKF не инициализирован → TECS ThO=0
+local function force_throttle(pwm)
+    if S.thr_chan == nil then return end
+    SRV_Channels:set_output_pwm_chan_timeout(
+        S.thr_chan, pwm, CFG.NO_GPS_THR_TMO)
+end
+
+-- v3.8.5: Адаптивный PWM газа по воздушной скорости (простой P-регулятор)
+-- base_pwm — базовый PWM для данной фазы полёта
+-- target_as — целевая воздушная скорость (м/с)
+local function compute_thr_pwm(base_pwm, target_as)
+    local as = get_as()
+    if not as then return base_pwm end
+    local err = target_as - as
+    -- 25 PWM на каждый м/с ошибки скорости
+    return clamp(base_pwm + err * 25, 1100, 1900)
+end
+
+-- v3.8.5: Проверка восстановления GPS (для перехода с прямого газа на TECS)
+local function check_gps_recovery()
+    if not S.no_gps_motor then return false end
+    local fix = gps:status(0)
+    local sats = gps:num_sats(0) or 0
+    if fix >= 3 and sats >= 4 and ahrs:healthy() then
+        S.no_gps_motor = false
+        lg(SEV_ALERT, "GPS RECOVERED fix:" .. fix ..
+            " sats:" .. sats .. " > GUIDED+TECS")
+        return true
+    end
+    return false
 end
 
 ------------------------------------------------------------
@@ -1145,6 +1202,52 @@ local function navigate()
     -- Обновить мин. дистанцию до цели
     if d2t < S.min_d2t then S.min_d2t = d2t end
 
+    -- v3.8.5: NO-GPS motor mode — FBWA + прямой газ для всех фаз
+    if S.no_gps_motor then
+        -- Проверяем восстановление GPS
+        if check_gps_recovery() then
+            -- GPS восстановился — штатная навигация со следующего цикла
+            lg(SEV_NOTICE, "GPS OK > resuming GUIDED navigation")
+            return
+        end
+
+        -- Переход CLIMB → CRUISE (работает без GPS через baro)
+        if S.phase == "CLIMB" then
+            local alt = baro:get_altitude()
+            if alt and alt >= CFG.ALT * 0.95 then
+                S.phase = "CRUISE"
+                wipe_launch_data()
+                S.as_buf = {}; S.as_idx = 0; S.pitot_score = 0
+                lg(SEV_INFO, "CRUISE [NO-GPS] H=" .. math.floor(alt))
+            end
+        end
+
+        -- TERMINAL / DIVE transitions
+        if d2t < CFG.TERM_RADIUS and S.phase ~= "TERMINAL" and S.phase ~= "DIVE" then
+            S.phase = "TERMINAL"
+            S.term_ms = ms()
+            wipe_launch_data()
+            lg(SEV_ALERT, "*** TERMINAL [NO-GPS] *** D=" .. math.floor(d2t))
+        end
+        if S.phase == "TERMINAL" and (ms() - S.term_ms) > CFG.TERM_PREP_MS then
+            S.phase = "DIVE"
+            lg(SEV_ALERT, "*** DIVE [NO-GPS] ***")
+        end
+
+        -- Управление газом и режимом
+        setmode(MODE_FBWA)
+        if S.phase == "DIVE" then
+            force_throttle(1100)  -- idle — пикирование на гравитации
+        elseif S.phase == "CLIMB" then
+            force_throttle(compute_thr_pwm(CFG.NO_GPS_THR_CLIMB, CFG.ASPD))
+        else  -- CRUISE, TERMINAL
+            force_throttle(compute_thr_pwm(CFG.NO_GPS_THR_CRUISE, CFG.ASPD))
+        end
+        return
+    end
+
+    -- === Штатная навигация (GPS available) ===
+
     -- Защита от разворота: если цель позади и удаляемся
     local hdg_diff = math.abs(w180((b2t - S.init_hdg) * R2D))
     if hdg_diff > 90 and d2t > S.min_d2t + 500 then
@@ -1353,6 +1456,16 @@ local function update()
                 S.launch_g_x, S.launch_g_y, S.launch_g_z = 0, 0, 9.81
                 lg(SEV_WARN, "INS unavailable — using default g-baseline")
             end
+            -- v3.8.5: кэш канала газа + диагностика GPS при арме
+            local ok_ch, ch = pcall(function() return SRV_Channels:find_channel(70) end)
+            S.thr_chan = ok_ch and ch or nil
+            local gfix = gps:status(0)
+            local gsats = gps:num_sats(0) or 0
+            lg(SEV_NOTICE, "GPS:" .. gfix .. " SATS:" .. gsats ..
+                " THR_CH:" .. (S.thr_chan ~= nil and tostring(S.thr_chan) or "nil"))
+            if gfix < 3 then
+                lg(SEV_ERR, "NO GPS FIX AT ARM — motor fallback will be used at throw")
+            end
             setmode(MODE_FBWA)  -- мотор выключен (нет RC) — ждём рывок катапульты
             S.launch_thrown = false
             S.phase = "LAUNCH"; S.launch_ms = ms()
@@ -1383,21 +1496,33 @@ local function update()
                     S.launch_thrown = true
                     S.throw_ms = ms()
                     lg(SEV_ALERT, "THROW! da=" .. string.format("%.1f", da) .. "m/s2 > MOTOR ON")
-                    -- v3.8.4: сохраняем штатные лимиты, ставим PITCH_MAX=30 для spool
-                    -- Param файл может иметь TECS_PITCH_MAX=15-20, что недостаточно
-                    -- для стартового разгона. 30° даёт TECS полную свободу → max throttle.
-                    S.pitch_max_saved = param:get('TECS_PITCH_MAX') or 20
-                    S.roll_lim_saved  = param:get('ROLL_LIMIT_DEG') or 45
-                    pset('TECS_PITCH_MAX', 30)   -- v3.8.4: полная свобода TECS при spool
-                    pset('ROLL_LIMIT_DEG', 45)   -- v3.8.4: не ограничиваем крен при spool
-                    -- v3.8: target = CFG.ALT (1000м) — TECS получает большой дефицит → полный газ
-                    local hdg = S.tgt_valid
-                        and brg(S.dr_lat, S.dr_lng, S.tgt_lat, S.tgt_lng)
-                        or  S.init_hdg
-                    local wl, wo = movept(S.dr_lat, S.dr_lng, hdg, CFG.WPT_AHEAD)
-                    setmode(MODE_GUIDED)
-                    if not vehicle:set_target_location(mkloc(wl, wo, CFG.ALT, true)) then
-                        lg(SEV_WARN, "THROW: TGT FAIL — check DR pos")
+                    -- v3.8.5: проверяем GPS для выбора стратегии управления мотором
+                    local gfix = gps:status(0)
+                    local gsats = gps:num_sats(0) or 0
+                    if gfix >= 3 and gsats >= 4 then
+                        -- Путь A: GPS OK → GUIDED + TECS (штатный)
+                        S.no_gps_motor = false
+                        S.pitch_max_saved = param:get('TECS_PITCH_MAX') or 20
+                        S.roll_lim_saved  = param:get('ROLL_LIMIT_DEG') or 45
+                        pset('TECS_PITCH_MAX', 30)
+                        pset('ROLL_LIMIT_DEG', 45)
+                        local hdg = S.tgt_valid
+                            and brg(S.dr_lat, S.dr_lng, S.tgt_lat, S.tgt_lng)
+                            or  S.init_hdg
+                        local wl, wo = movept(S.dr_lat, S.dr_lng, hdg, CFG.WPT_AHEAD)
+                        setmode(MODE_GUIDED)
+                        if not vehicle:set_target_location(mkloc(wl, wo, CFG.ALT, true)) then
+                            lg(SEV_WARN, "THROW: TGT FAIL — check DR pos")
+                        end
+                        lg(SEV_NOTICE, "THROW: GPS OK fix:" .. gfix .. " > GUIDED+TECS")
+                    else
+                        -- Путь B: NO GPS → FBWA + прямой газ через SRV_Channels
+                        S.no_gps_motor = true
+                        setmode(MODE_FBWA)
+                        force_throttle(CFG.NO_GPS_THR_SPOOL)
+                        lg(SEV_ERR, "THROW: NO GPS fix:" .. gfix ..
+                            " sats:" .. gsats .. " > FBWA+DIRECT THR " ..
+                            CFG.NO_GPS_THR_SPOOL .. "us")
                     end
                 end
             else
@@ -1414,38 +1539,61 @@ local function update()
         --   Путь 2: INS nil fallback — get_likely_flying() с guards (elapsed>3s, AS>5)
         --     Guards отсекают ложный TAKEOFF mode который ставит likely_flying=true при арме
         if S.launch_thrown and (ms() - S.throw_ms) > 3000 then
-            -- Путь 1: мотор крутится 3с с полным pitch → теперь ограничиваем
-            pset('TECS_PITCH_MAX', CFG.TKOFF_PITCH_LIM)
-            pset('ROLL_LIMIT_DEG', CFG.TKOFF_ROLL_LIM)
+            -- Путь 1: 3с spool завершён → переход в SOFT_CLIMB
+            if S.no_gps_motor then
+                -- v3.8.5: без GPS — остаёмся в FBWA, снижаем газ до climb
+                force_throttle(CFG.NO_GPS_THR_CLIMB)
+            else
+                -- Штатный: ограничиваем pitch/roll, GUIDED продолжает
+                pset('TECS_PITCH_MAX', CFG.TKOFF_PITCH_LIM)
+                pset('ROLL_LIMIT_DEG', CFG.TKOFF_ROLL_LIM)
+                setmode(MODE_GUIDED)
+            end
             S.phase = "SOFT_CLIMB"; S.soft_climb_ms = ms(); S.dr_last_ms = ms()
-            lg(SEV_ALERT, "LAUNCHED > SOFT_CLIMB (pitch<=" ..
-                CFG.TKOFF_PITCH_LIM .. " roll<=" .. CFG.TKOFF_ROLL_LIM .. ")")
-            setmode(MODE_GUIDED)
+            lg(SEV_ALERT, "LAUNCHED > SOFT_CLIMB" ..
+                (S.no_gps_motor and " [NO-GPS FBWA+THR]"
+                or " (pitch<=" .. CFG.TKOFF_PITCH_LIM ..
+                   " roll<=" .. CFG.TKOFF_ROLL_LIM .. ")"))
         elseif S.launch_thrown then
-            -- Мотор раскручивается — ждём 3с, диагностика
+            -- Мотор раскручивается — ждём 3с
+            if S.no_gps_motor then
+                force_throttle(CFG.NO_GPS_THR_SPOOL)  -- v3.8.5: поддерживаем газ каждый цикл
+            end
             if (ms() - S.launch_diag_ms) >= 1000 then
                 S.launch_diag_ms = ms()
                 local t_left = math.floor((3000 - (ms() - S.throw_ms)) / 1000)
-                lg(SEV_INFO, "THROW: motor spool " .. t_left .. "s")
+                lg(SEV_INFO, "THROW: motor spool " .. t_left .. "s" ..
+                    (S.no_gps_motor and " [DIRECT THR]" or ""))
             end
         elseif vehicle:get_likely_flying()
            and (ms() - S.launch_ms) > 3000
            and get_as() and get_as() > 5
         then
             -- Путь 2: fallback — INS nil, но борт реально летит
-            S.pitch_max_saved = param:get('TECS_PITCH_MAX') or 20
-            S.roll_lim_saved  = param:get('ROLL_LIMIT_DEG') or 45
             S.launch_thrown = true
             S.throw_ms = ms()
-            pset('TECS_PITCH_MAX', 30)   -- v3.8.4: полная свобода TECS при spool
-            pset('ROLL_LIMIT_DEG', 45)   -- v3.8.4: не ограничиваем крен при spool
-            lg(SEV_WARN, "FLYING w/o throw detect — GUIDED + full ALT target")
-            setmode(MODE_GUIDED)
-            local hdg = S.tgt_valid
-                and brg(S.dr_lat, S.dr_lng, S.tgt_lat, S.tgt_lng)
-                or S.init_hdg
-            local wl, wo = movept(S.dr_lat, S.dr_lng, hdg, CFG.WPT_AHEAD)
-            vehicle:set_target_location(mkloc(wl, wo, CFG.ALT, true))
+            -- v3.8.5: проверяем GPS и для fallback пути
+            local gfix = gps:status(0)
+            local gsats = gps:num_sats(0) or 0
+            if gfix >= 3 and gsats >= 4 then
+                S.no_gps_motor = false
+                S.pitch_max_saved = param:get('TECS_PITCH_MAX') or 20
+                S.roll_lim_saved  = param:get('ROLL_LIMIT_DEG') or 45
+                pset('TECS_PITCH_MAX', 30)
+                pset('ROLL_LIMIT_DEG', 45)
+                lg(SEV_WARN, "FLYING w/o throw — GUIDED (GPS OK)")
+                setmode(MODE_GUIDED)
+                local hdg = S.tgt_valid
+                    and brg(S.dr_lat, S.dr_lng, S.tgt_lat, S.tgt_lng)
+                    or S.init_hdg
+                local wl, wo = movept(S.dr_lat, S.dr_lng, hdg, CFG.WPT_AHEAD)
+                vehicle:set_target_location(mkloc(wl, wo, CFG.ALT, true))
+            else
+                S.no_gps_motor = true
+                setmode(MODE_FBWA)
+                force_throttle(CFG.NO_GPS_THR_SPOOL)
+                lg(SEV_ERR, "FLYING w/o throw — NO GPS > FBWA+DIRECT THR")
+            end
             -- НЕ ставим pitch/roll limits сразу — ждём 3с spool (следующая итерация)
         elseif (ms() - S.launch_ms) > CFG.LAUNCH_TIMEOUT then
             lg(SEV_ERR, "LAUNCH TIMEOUT — DISARM")
@@ -1463,14 +1611,42 @@ local function update()
         local alt = baro:get_altitude()
         local as = get_as()
 
-        -- v3.8: target = ALT (1000м) — TECS даёт газ для набора
-        -- Ограничения pitch/roll уже установлены при входе в SOFT_CLIMB
-        setmode(MODE_GUIDED)
-        local hdg = S.tgt_valid
-            and brg(S.dr_lat, S.dr_lng, S.tgt_lat, S.tgt_lng)
-            or S.init_hdg
-        local wl, wo = movept(S.dr_lat, S.dr_lng, hdg, CFG.WPT_AHEAD)
-        vehicle:set_target_location(mkloc(wl, wo, CFG.ALT, true))
+        -- v3.8.5: проверяем восстановление GPS
+        if S.no_gps_motor and check_gps_recovery() then
+            -- GPS появился — переключаемся на штатный GUIDED + TECS
+            S.pitch_max_saved = param:get('TECS_PITCH_MAX') or 20
+            S.roll_lim_saved  = param:get('ROLL_LIMIT_DEG') or 45
+            pset('TECS_PITCH_MAX', CFG.TKOFF_PITCH_LIM)
+            pset('ROLL_LIMIT_DEG', CFG.TKOFF_ROLL_LIM)
+        end
+
+        if S.no_gps_motor then
+            -- v3.8.5: без GPS — FBWA + прямой газ по Pitot
+            setmode(MODE_FBWA)
+            force_throttle(compute_thr_pwm(CFG.NO_GPS_THR_CLIMB, CFG.ASPD))
+        else
+            -- Штатный: GUIDED + TECS
+            setmode(MODE_GUIDED)
+            local hdg = S.tgt_valid
+                and brg(S.dr_lat, S.dr_lng, S.tgt_lat, S.tgt_lng)
+                or S.init_hdg
+            local wl, wo = movept(S.dr_lat, S.dr_lng, hdg, CFG.WPT_AHEAD)
+            vehicle:set_target_location(mkloc(wl, wo, CFG.ALT, true))
+
+            -- v3.8.5: Safety — если TECS не даёт газ через 2с после SOFT_CLIMB
+            if (ms() - S.soft_climb_ms) > 2000 then
+                local ok_thr, thr_pwm = pcall(function()
+                    return SRV_Channels:get_output_pwm(70)
+                end)
+                if ok_thr and thr_pwm and thr_pwm < 1200 then
+                    S.no_gps_motor = true
+                    setmode(MODE_FBWA)
+                    force_throttle(CFG.NO_GPS_THR_CLIMB)
+                    lg(SEV_ERR, "TECS FAIL — THR:" .. thr_pwm ..
+                        "us < 1200 > FBWA+DIRECT THR (EKF not ready?)")
+                end
+            end
+        end
 
         -- Диагностика каждые 2с
         if (ms() - S.launch_diag_ms) >= 2000 then
@@ -1478,24 +1654,29 @@ local function update()
             lg(SEV_INFO, "SOFT_CLIMB H:" .. math.floor(alt or 0) ..
                 "/" .. CFG.TKOFF_SAFE_ALT ..
                 " V:" .. math.floor(as or 0) ..
-                "/" .. CFG.TKOFF_SAFE_ASPD)
+                "/" .. CFG.TKOFF_SAFE_ASPD ..
+                (S.no_gps_motor and " [NO-GPS]" or ""))
         end
 
         -- Переход в CLIMB при достижении безопасных параметров
         if alt and alt >= CFG.TKOFF_SAFE_ALT * 0.9
            and as and as >= CFG.TKOFF_SAFE_ASPD then
-            -- Восстанавливаем штатные лимиты
-            pset('TECS_PITCH_MAX', S.pitch_max_saved)
-            pset('ROLL_LIMIT_DEG', S.roll_lim_saved)
+            if not S.no_gps_motor then
+                pset('TECS_PITCH_MAX', S.pitch_max_saved)
+                pset('ROLL_LIMIT_DEG', S.roll_lim_saved)
+            end
             S.phase = "CLIMB"
             lg(SEV_ALERT, "SOFT_CLIMB OK H:" .. math.floor(alt) ..
-                " V:" .. math.floor(as) .. " > CLIMB " .. CFG.ALT .. "m")
+                " V:" .. math.floor(as) .. " > CLIMB " .. CFG.ALT .. "m" ..
+                (S.no_gps_motor and " [NO-GPS]" or ""))
         end
 
         -- Мягкий таймаут: 60с + скорость >= 80% порога — переходить
         if (ms() - S.soft_climb_ms) > 60000 and as and as >= CFG.TKOFF_SAFE_ASPD * 0.8 then
-            pset('TECS_PITCH_MAX', S.pitch_max_saved)
-            pset('ROLL_LIMIT_DEG', S.roll_lim_saved)
+            if not S.no_gps_motor then
+                pset('TECS_PITCH_MAX', S.pitch_max_saved)
+                pset('ROLL_LIMIT_DEG', S.roll_lim_saved)
+            end
             S.phase = "CLIMB"
             lg(SEV_WARN, "SOFT_CLIMB TIMEOUT > CLIMB H:" .. math.floor(alt or 0))
         end
@@ -1503,8 +1684,10 @@ local function update()
         -- Абсолютный таймаут: 90с — восстановить лимиты в любом случае
         -- Защита от зависания при отказе Pitot (as=nil блокирует мягкий таймаут)
         if (ms() - S.soft_climb_ms) > 90000 then
-            pset('TECS_PITCH_MAX', S.pitch_max_saved)
-            pset('ROLL_LIMIT_DEG', S.roll_lim_saved)
+            if not S.no_gps_motor then
+                pset('TECS_PITCH_MAX', S.pitch_max_saved)
+                pset('ROLL_LIMIT_DEG', S.roll_lim_saved)
+            end
             S.phase = "CLIMB"
             lg(SEV_ERR, "SOFT_CLIMB HARD TIMEOUT 90s > CLIMB H:" .. math.floor(alt or 0))
         end
@@ -1530,7 +1713,7 @@ end
 -- СТАРТ
 ------------------------------------------------------------
 lg(SEV_NOTICE, "===========================")
-lg(SEV_NOTICE, "  WING NAV v3.8.3 7L+PITOT+THROW+SAFETKO")
+lg(SEV_NOTICE, "  WING NAV v3.8.5 7L+PITOT+THROW+SAFETKO+NOGPS")
 lg(SEV_NOTICE, "  Alt:" .. CFG.ALT .. " Spd:" .. math.floor(CFG.ASPD))
 lg(SEV_NOTICE, "  Dist:" .. math.floor(CFG.MISSION_DIST / 1000) .. "km")
 lg(SEV_NOTICE, "===========================")
