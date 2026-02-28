@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPECTRE Firmware</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117;
+            color: #e6edf3;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            max-width: 500px;
+            width: 90%;
+            padding: 40px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+        }
+        h1 {
+            font-size: 24px;
+            margin-bottom: 8px;
+            color: #f0f6fc;
+        }
+        .subtitle {
+            color: #8b949e;
+            font-size: 14px;
+            margin-bottom: 32px;
+        }
+        .file-card {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .file-info h3 {
+            font-size: 16px;
+            color: #e6edf3;
+            margin-bottom: 4px;
+        }
+        .file-info p {
+            font-size: 13px;
+            color: #8b949e;
+        }
+        .btn {
+            display: inline-block;
+            padding: 8px 20px;
+            background: #238636;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            white-space: nowrap;
+            transition: background 0.2s;
+        }
+        .btn:hover { background: #2ea043; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SPECTRE Firmware</h1>
+        <p class="subtitle">Файлы прошивки для скачивания</p>
+
+        <div class="file-card">
+            <div class="file-info">
+                <h3>wing_nav_v3.lua</h3>
+                <p>Навигационный скрипт</p>
+            </div>
+            <a class="btn" href="https://raw.githubusercontent.com/perss-spec/spectre-fw-release/main/wing_nav_v3.lua" download>Скачать</a>
+        </div>
+
+        <div class="file-card">
+            <div class="file-info">
+                <h3>Spectr_Cube+.param</h3>
+                <p>Параметры автопилота</p>
+            </div>
+            <a class="btn" href="https://raw.githubusercontent.com/perss-spec/spectre-fw-release/main/Spectr_Cube_Plus.param" download>Скачать</a>
+        </div>
+    </div>
+</body>
+</html>
