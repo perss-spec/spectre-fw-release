@@ -1,8 +1,16 @@
 --[[============================================================
-  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.8
+  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.9
   Полётный контроллер: OrangeCube (ArduPlane)
   Параметры: Spectr_Cube+.param + param_changes.param
 ============================================================
+  ИЗМЕНЕНИЯ v3.8.9 (disarm motor kill, 2026-03-02):
+    + FIX КРИТИЧЕСКИЙ: мотор не останавливался при дизарме.
+      force_throttle() через SRV_Channels продолжал PWM override после дизарма.
+      Lua-цикл update() не проверял arming:is_armed() → мотор крутился бесконечно.
+      Исправление: проверка is_armed() в начале update() для всех активных фаз.
+      При дизарме: PWM=1100 (idle), восстановление TECS/pitch/roll/terminal params,
+      сброс фазы в WAIT_ARM для чистого реарма.
+
   ИЗМЕНЕНИЯ v3.8.8 (battery failsafe dive, 2026-03-02):
     + ADD: Battery failsafe — принудительный DIVE при глубоком разряде АКБ.
       battery:voltage(0) → скользящее среднее 5 замеров (1с).
@@ -1528,6 +1536,33 @@ end
 ------------------------------------------------------------
 local function update()
 
+    -- v3.8.9: DISARM SAFETY — мотор стоп + восстановление параметров
+    if S.phase ~= "INIT" and S.phase ~= "WAIT_ARM" and not arming:is_armed() then
+        -- Безусловный motor kill
+        if S.thr_chan ~= nil then
+            SRV_Channels:set_output_pwm_chan_timeout(S.thr_chan, 1100, 0)
+        end
+        -- Восстановление параметров
+        if S.pitch_max_saved then
+            pset('TECS_PITCH_MAX', S.pitch_max_saved)
+        end
+        if S.roll_lim_saved then
+            pset('ROLL_LIMIT_DEG', S.roll_lim_saved)
+        end
+        if S.term_params then
+            pset('TECS_SINK_MAX', 5)
+            pset('TECS_PITCH_MIN', -25)
+            pset('PTCH_LIM_MIN_DEG', -25)
+        end
+        lg(SEV_ALERT, "DISARM DETECTED — MOTOR KILL, PARAMS RESTORED")
+        S.phase = "WAIT_ARM"
+        S.launch_thrown = false
+        S.no_gps_motor = false
+        S.term_params = false
+        S.cur_mode = -1
+        return update, CFG.LOOP_MS
+    end
+
     -- INIT
     if S.phase == "INIT" then
         local h = ahrs:get_yaw()
@@ -1867,7 +1902,7 @@ end
 -- СТАРТ
 ------------------------------------------------------------
 lg(SEV_NOTICE, "===========================")
-lg(SEV_NOTICE, "  WING NAV v3.8.8 7L+PITOT+THROW+SAFETKO+NOGPS+WIPE+BATT")
+lg(SEV_NOTICE, "  WING NAV v3.8.9 7L+PITOT+THROW+SAFETKO+NOGPS+WIPE+BATT+DISARM")
 lg(SEV_NOTICE, "  Alt:" .. CFG.ALT .. " Spd:" .. math.floor(CFG.ASPD))
 lg(SEV_NOTICE, "  Dist:" .. math.floor(CFG.MISSION_DIST / 1000) .. "km")
 lg(SEV_NOTICE, "===========================")
