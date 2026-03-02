@@ -1,8 +1,35 @@
 --[[============================================================
-  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.5
+  БПЛА "КРЫЛО" — Навигация + Антиспуфинг v3.8.8
   Полётный контроллер: OrangeCube (ArduPlane)
   Параметры: Spectr_Cube+.param + param_changes.param
 ============================================================
+  ИЗМЕНЕНИЯ v3.8.8 (battery failsafe dive, 2026-03-02):
+    + ADD: Battery failsafe — принудительный DIVE при глубоком разряде АКБ.
+      battery:voltage(0) → скользящее среднее 5 замеров (1с).
+      Порог: BATT_DIVE_VOLT=24.0V (8S × 3.0V/cell — максимальная просадка).
+      Срабатывает в CRUISE/CLIMB → TERMINAL → DIVE.
+      Работает и в NO-GPS, и в штатном режиме.
+    + ADD: CFG.BATT_DIVE_VOLT, BATT_BUF_SIZE, BATT_CHECK_PHASES
+    + ADD: S.batt_buf, batt_idx, batt_avg, batt_triggered
+
+  ИЗМЕНЕНИЯ v3.8.7 (launch security + spool tuning, 2026-03-02):
+    + SEC: wipe_launch_data() вызывается сразу при переходе в SOFT_CLIMB (~0.4с после броска).
+      Ранее координаты старта и цели оставались в памяти до CRUISE/TERMINAL.
+      При падении на LAUNCH/SOFT_CLIMB/CLIMB координаты были доступны.
+    + CHANGE: NO_GPS_THR_SPOOL 1750→1900 (100% газ при spool для максимального ускорения)
+    + CHANGE: SPOOL_MS — новый параметр CFG, заменяет хардкод 3000мс. Установлен 400мс.
+    + FIX: диагностика spool адаптирована под короткий интервал (200мс период, мс единицы)
+
+  ИЗМЕНЕНИЯ v3.8.6 (GPS recovery anti-spoof gate, 2026-02-28):
+    + FIX: check_gps_recovery() принимал GPS без проверки антиспуфинга — уязвимость.
+      Теперь три слоя защиты перед принятием GPS:
+      1. Период наблюдения (GPS_RECOVERY_OBSERVE_MS=5с) — L1+L2+L6 успевают оценить сигнал
+      2. Anti-spoofing score gate — если gps_score >= SP_SCORE_THR (50), recovery заблокирован
+      3. DR-GPS санитарная проверка — если DR > 2км, GPS-позиция не должна расходиться
+         с DR-позицией больше чем на max(500м, 10% от dr_dist)
+    + ADD: CFG.GPS_RECOVERY_OBSERVE_MS, GPS_RECOVERY_DR_TOL, GPS_RECOVERY_DR_MIN
+    + ADD: S.gps_recovery_check_ms — таймер наблюдения
+
   ИЗМЕНЕНИЯ v3.8.5 (no-GPS motor fallback, 2026-02-28):
     + FIX КРИТИЧЕСКИЙ: мотор не стартовал без GPS — EKF не инициализирован →
       TECS не может управлять газом → ThO=0 → C3=1100 (idle) весь полёт.
@@ -226,7 +253,7 @@ local CFG = {
 
     -- ======= КАТАПУЛЬТА (v3.4) =======
     -- Детекция через вектор: da = |accel - g_baseline|, без геометрической погрешности
-    LAUNCH_ACC_THR  = 3.0,    -- м/с² динамического ускорения сверх гравитации (~0.3g)
+    LAUNCH_ACC_THR  = 5.0,    -- м/с² динамического ускорения сверх гравитации (~0.5g)
     LAUNCH_LOOP_MS  = 50,     -- мс — период опроса IMU в фазе LAUNCH (быстрее основного цикла)
     LAUNCH_TIMEOUT  = 300000, -- мс — таймаут ожидания броска (5 минут)
 
@@ -240,10 +267,21 @@ local CFG = {
     -- ======= NO-GPS MOTOR FALLBACK (v3.8.5) =======
     -- Когда GPS отсутствует: EKF не инициализирован → TECS ThO=0 → мотор idle.
     -- Используем SRV_Channels:set_output_pwm_chan_timeout() для прямого PWM.
-    NO_GPS_THR_SPOOL  = 1750,   -- PWM при spool (мощный стартовый газ, ~80%)
+    NO_GPS_THR_SPOOL  = 1900,   -- PWM при spool (полный газ, 100%)
+    SPOOL_MS          = 400,    -- мс задержка spool после броска
     NO_GPS_THR_CLIMB  = 1650,   -- PWM при SOFT_CLIMB/CLIMB (~70%)
     NO_GPS_THR_CRUISE = 1500,   -- PWM при CRUISE (~50%)
     NO_GPS_THR_TMO    = 500,    -- мс timeout PWM override (безопасность — если Lua упадёт)
+    GPS_RECOVERY_OBSERVE_MS = 5000,  -- v3.8.6: мин. наблюдение GPS перед recovery (5с)
+    GPS_RECOVERY_DR_TOL = 0.10,      -- v3.8.6: допуск DR-GPS (10% от dr_dist)
+    GPS_RECOVERY_DR_MIN = 500,       -- v3.8.6: мин. допуск DR-GPS (м)
+
+    -- ======= BATTERY FAILSAFE (v3.8.8) =======
+    -- 8S LiPo: 3.0V/cell = 24.0V — глубокий разряд, мотор уже не тянет.
+    -- Скользящее среднее 5 замеров (1с при LOOP_MS=200) — фильтрация просадок под нагрузкой.
+    BATT_DIVE_VOLT    = 24.0,   -- V — порог принудительного DIVE (8S × 3.0V/cell)
+    BATT_BUF_SIZE     = 5,      -- количество замеров для скользящего среднего
+    BATT_CHECK_PHASES = true,   -- проверять только в CRUISE/CLIMB (не в TERMINAL/DIVE)
 
     -- ======= СИСТЕМА =======
     LOOP_MS         = 200,
@@ -355,6 +393,13 @@ local S = {
     -- NO-GPS motor fallback (v3.8.5)
     no_gps_motor     = false, -- GPS отсутствует → прямое управление газом через PWM
     thr_chan          = nil,   -- кэш канала газа (SRV_Channels:find_channel(70))
+    gps_recovery_check_ms = 0, -- v3.8.6: начало мониторинга GPS recovery
+
+    -- Battery failsafe (v3.8.8)
+    batt_buf         = {},      -- кольцевой буфер напряжений
+    batt_idx         = 0,       -- текущий индекс в буфере
+    batt_avg         = 0,       -- скользящее среднее напряжения
+    batt_triggered   = false,   -- failsafe уже сработал
 
     -- S-поворот GPS верификация (v3.6)
     sturn_phase     = 0,      -- 0=idle, 1=turning (ждём оседания), 2=measuring
@@ -457,15 +502,99 @@ local function compute_thr_pwm(base_pwm, target_as)
     return clamp(base_pwm + err * 25, 1100, 1900)
 end
 
--- v3.8.5: Проверка восстановления GPS (для перехода с прямого газа на TECS)
+-- v3.8.6: Проверка восстановления GPS с антиспуфинг-валидацией
+-- 1. Период наблюдения (GPS_RECOVERY_OBSERVE_MS) — даёт check_gps() время на L1+L2+L6
+-- 2. Антиспуфинг score gate — блокирует recovery при score >= SP_SCORE_THR
+-- 3. DR-GPS санитарная проверка — блокирует при расхождении DR vs GPS
 local function check_gps_recovery()
     if not S.no_gps_motor then return false end
     local fix = gps:status(0)
     local sats = gps:num_sats(0) or 0
+
     if fix >= 3 and sats >= 4 and ahrs:healthy() then
+        -- Начинаем период наблюдения
+        if S.gps_recovery_check_ms == 0 then
+            S.gps_recovery_check_ms = ms()
+            lg(SEV_NOTICE, "GPS RECOVERY OBSERVE start fix:" .. fix .. " sats:" .. sats)
+            return false
+        end
+
+        local elapsed = ms() - S.gps_recovery_check_ms
+
+        -- Ждём минимальный период наблюдения
+        if elapsed < CFG.GPS_RECOVERY_OBSERVE_MS then
+            return false
+        end
+
+        -- Проверка 1: антиспуфинг score (check_gps() уже обновил score)
+        if S.gps_score >= CFG.SP_SCORE_THR then
+            lg(SEV_WARN, "GPS RECOVERY BLOCKED antispoof sc:" ..
+                math.floor(S.gps_score) .. ">=" .. CFG.SP_SCORE_THR)
+            S.gps_recovery_check_ms = 0
+            return false
+        end
+
+        -- Проверка 2: DR-GPS расхождение (если DR достаточно накоплен)
+        if S.dr_dist > 2000 then
+            local gloc = gps:location(0)
+            if gloc then
+                local glat = gloc:lat() / 1e7
+                local glng = gloc:lng() / 1e7
+                local dgps = hdist(S.dr_lat, S.dr_lng, glat, glng)
+                local tol = math.max(CFG.GPS_RECOVERY_DR_MIN,
+                    S.dr_dist * CFG.GPS_RECOVERY_DR_TOL)
+                if dgps > tol then
+                    lg(SEV_WARN, "GPS RECOVERY BLOCKED DR-GPS:" ..
+                        math.floor(dgps) .. "m tol:" .. math.floor(tol) .. "m")
+                    S.gps_recovery_check_ms = 0
+                    return false
+                end
+            end
+        end
+
+        -- Все проверки пройдены — принимаем GPS
         S.no_gps_motor = false
+        S.gps_recovery_check_ms = 0
         lg(SEV_ALERT, "GPS RECOVERED fix:" .. fix ..
-            " sats:" .. sats .. " > GUIDED+TECS")
+            " sats:" .. sats .. " sc:" .. math.floor(S.gps_score) ..
+            " obs:" .. math.floor(elapsed) .. "ms > GUIDED+TECS")
+        return true
+    else
+        -- GPS потерян — сброс таймера наблюдения
+        if S.gps_recovery_check_ms ~= 0 then
+            S.gps_recovery_check_ms = 0
+            lg(SEV_NOTICE, "GPS RECOVERY OBSERVE reset: signal lost")
+        end
+        return false
+    end
+end
+
+------------------------------------------------------------
+-- BATTERY FAILSAFE (v3.8.8)
+-- Скользящее среднее напряжения. Возвращает true если батарея сдохла.
+------------------------------------------------------------
+local function check_battery_dive()
+    if S.batt_triggered then return true end
+    local v = battery:voltage(0)
+    if not v or v <= 0 then return false end
+
+    -- Кольцевой буфер
+    S.batt_idx = S.batt_idx % CFG.BATT_BUF_SIZE + 1
+    S.batt_buf[S.batt_idx] = v
+
+    -- Не проверяем пока буфер не заполнен
+    if #S.batt_buf < CFG.BATT_BUF_SIZE then return false end
+
+    -- Среднее
+    local sum = 0
+    for i = 1, CFG.BATT_BUF_SIZE do sum = sum + S.batt_buf[i] end
+    S.batt_avg = sum / CFG.BATT_BUF_SIZE
+
+    if S.batt_avg <= CFG.BATT_DIVE_VOLT then
+        S.batt_triggered = true
+        lg(SEV_ALERT, "BATT FAILSAFE! avg:" ..
+            string.format("%.1f", S.batt_avg) .. "V <= " ..
+            string.format("%.1f", CFG.BATT_DIVE_VOLT) .. "V > DIVE")
         return true
     end
     return false
@@ -1222,6 +1351,17 @@ local function navigate()
             end
         end
 
+        -- v3.8.8: Battery failsafe — принудительный DIVE при разряде
+        if CFG.BATT_CHECK_PHASES and S.phase ~= "TERMINAL" and S.phase ~= "DIVE" then
+            if check_battery_dive() then
+                S.phase = "TERMINAL"
+                S.term_ms = ms()
+                wipe_launch_data()
+                lg(SEV_ALERT, "*** BATT TERMINAL [NO-GPS] *** V=" ..
+                    string.format("%.1f", S.batt_avg))
+            end
+        end
+
         -- TERMINAL / DIVE transitions
         if d2t < CFG.TERM_RADIUS and S.phase ~= "TERMINAL" and S.phase ~= "DIVE" then
             S.phase = "TERMINAL"
@@ -1247,6 +1387,18 @@ local function navigate()
     end
 
     -- === Штатная навигация (GPS available) ===
+
+    -- v3.8.8: Battery failsafe — принудительный DIVE при разряде
+    if CFG.BATT_CHECK_PHASES and S.phase ~= "TERMINAL" and S.phase ~= "DIVE" then
+        if check_battery_dive() then
+            S.phase = "TERMINAL"
+            S.term_ms = ms()
+            setup_terminal()
+            wipe_launch_data()
+            lg(SEV_ALERT, "*** BATT TERMINAL *** V=" ..
+                string.format("%.1f", S.batt_avg))
+        end
+    end
 
     -- Защита от разворота: если цель позади и удаляемся
     local hdg_diff = math.abs(w180((b2t - S.init_hdg) * R2D))
@@ -1350,12 +1502,13 @@ local function do_log()
 
     -- v3: не логируем координаты, только дистанции
     lg(SEV_INFO, string.format(
-        "%s H:%d V:%.0f C:%.0f D:%.0fk R:%.0fk G:%s[%s] S:%d P:%s",
+        "%s H:%d V:%.0f C:%.0f D:%.0fk R:%.0fk G:%s[%s] S:%d P:%s B:%.1f",
         S.phase, math.floor(alt), as, hdeg,
         S.dr_dist / 1000, d2t / 1000,
         S.gps_ok and "Y" or "N", S.gps_state,
         math.floor(S.gps_score),
-        S.pitot_iced and "ICE" or "OK"
+        S.pitot_iced and "ICE" or "OK",
+        S.batt_avg > 0 and S.batt_avg or (battery:voltage(0) or 0)
     ))
 
     logger:write('WNV3',
@@ -1535,11 +1688,11 @@ local function update()
         end
 
         -- v3.8.3: Два пути в SOFT_CLIMB:
-        --   Путь 1: IMU throw → ждём 3с (TECS раскручивает мотор без ограничений) → SOFT_CLIMB
+        --   Путь 1: IMU throw → ждём SPOOL_MS (TECS раскручивает мотор без ограничений) → SOFT_CLIMB
         --   Путь 2: INS nil fallback — get_likely_flying() с guards (elapsed>3s, AS>5)
         --     Guards отсекают ложный TAKEOFF mode который ставит likely_flying=true при арме
-        if S.launch_thrown and (ms() - S.throw_ms) > 3000 then
-            -- Путь 1: 3с spool завершён → переход в SOFT_CLIMB
+        if S.launch_thrown and (ms() - S.throw_ms) > CFG.SPOOL_MS then
+            -- Путь 1: spool завершён → переход в SOFT_CLIMB
             if S.no_gps_motor then
                 -- v3.8.5: без GPS — остаёмся в FBWA, снижаем газ до climb
                 force_throttle(CFG.NO_GPS_THR_CLIMB)
@@ -1550,19 +1703,20 @@ local function update()
                 setmode(MODE_GUIDED)
             end
             S.phase = "SOFT_CLIMB"; S.soft_climb_ms = ms(); S.dr_last_ms = ms()
+            wipe_launch_data()  -- v3.8.7: стираем координаты сразу после отрыва
             lg(SEV_ALERT, "LAUNCHED > SOFT_CLIMB" ..
                 (S.no_gps_motor and " [NO-GPS FBWA+THR]"
                 or " (pitch<=" .. CFG.TKOFF_PITCH_LIM ..
                    " roll<=" .. CFG.TKOFF_ROLL_LIM .. ")"))
         elseif S.launch_thrown then
-            -- Мотор раскручивается — ждём 3с
+            -- Мотор раскручивается — ждём SPOOL_MS
             if S.no_gps_motor then
                 force_throttle(CFG.NO_GPS_THR_SPOOL)  -- v3.8.5: поддерживаем газ каждый цикл
             end
-            if (ms() - S.launch_diag_ms) >= 1000 then
+            if (ms() - S.launch_diag_ms) >= 200 then
                 S.launch_diag_ms = ms()
-                local t_left = math.floor((3000 - (ms() - S.throw_ms)) / 1000)
-                lg(SEV_INFO, "THROW: motor spool " .. t_left .. "s" ..
+                local t_left = math.max(0, CFG.SPOOL_MS - (ms() - S.throw_ms))
+                lg(SEV_INFO, "THROW: motor spool " .. t_left .. "ms" ..
                     (S.no_gps_motor and " [DIRECT THR]" or ""))
             end
         elseif vehicle:get_likely_flying()
@@ -1713,7 +1867,7 @@ end
 -- СТАРТ
 ------------------------------------------------------------
 lg(SEV_NOTICE, "===========================")
-lg(SEV_NOTICE, "  WING NAV v3.8.5 7L+PITOT+THROW+SAFETKO+NOGPS")
+lg(SEV_NOTICE, "  WING NAV v3.8.8 7L+PITOT+THROW+SAFETKO+NOGPS+WIPE+BATT")
 lg(SEV_NOTICE, "  Alt:" .. CFG.ALT .. " Spd:" .. math.floor(CFG.ASPD))
 lg(SEV_NOTICE, "  Dist:" .. math.floor(CFG.MISSION_DIST / 1000) .. "km")
 lg(SEV_NOTICE, "===========================")
